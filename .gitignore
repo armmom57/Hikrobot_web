@@ -1,0 +1,29 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---------- ผลลัพธ์จากกล้อง (ไฟล์ที่สร้างตอนรัน) ----------
+images/*
+!images/.gitkeep
+videos/*
+!videos/.gitkeep
+*.mp4
+*.avi
+*.mkv
+
+# ---------- Editors / OS ----------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
