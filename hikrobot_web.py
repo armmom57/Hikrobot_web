@@ -56,6 +56,41 @@ RECORD_FPS_CAP = 30     # จำกัด fps ที่เขียนลงว�
 DEFAULT_FPS = 15
 CONTRAST_MIN = 0.2
 CONTRAST_MAX = 3.0
+SCAN_INTERVAL_S = 3.0   # ตอนยังไม่มีกล้อง จะสแกน/ต่อใหม่อัตโนมัติทุกกี่วินาที
+LOST_AFTER_S = 2.0      # ไม่ได้เฟรมนานเท่านี้ ให้ตรวจว่ากล้องหลุดหรือไม่
+
+# ลำดับรูปแบบภาพที่ลอง: กล้องสีใช้ Bayer ก่อน (ข้อมูลน้อยกว่า BGR 3 เท่า เหมาะกับ LAN)
+# กล้องขาวดำไม่รองรับรูปแบบสี จึงตกลงมาที่ Mono8 เอง
+# OpenCV ตั้งชื่อ Bayer ต่างจาก GenICam (BayerRG ของ GenICam = COLOR_BayerBG2BGR ของ OpenCV)
+PIXEL_FORMATS = [
+    (PixelType_Gvsp_BayerRG8, "BayerRG8", cv2.COLOR_BayerBG2BGR),
+    (PixelType_Gvsp_BayerGB8, "BayerGB8", cv2.COLOR_BayerGR2BGR),
+    (PixelType_Gvsp_BayerGR8, "BayerGR8", cv2.COLOR_BayerGB2BGR),
+    (PixelType_Gvsp_BayerBG8, "BayerBG8", cv2.COLOR_BayerRG2BGR),
+    (PixelType_Gvsp_BGR8_Packed, "BGR8", "bgr"),
+    (PixelType_Gvsp_RGB8_Packed, "RGB8", "rgb"),
+    (PixelType_Gvsp_Mono8, "Mono8", None),
+]
+
+
+def _cstr(chars):
+    return bytes(chars).split(b"\0", 1)[0].decode("utf-8", "replace")
+
+
+def _device_meta(device):
+    """สรุปข้อมูลกล้องหนึ่งตัวสำหรับแสดงในรายการเลือก"""
+    if device.nTLayerType == MV_GIGE_DEVICE:
+        info = device.SpecialInfo.stGigEInfo
+        ip = int(info.nCurrentIp)
+        extra = " · " + ".".join(str((ip >> shift) & 255) for shift in (24, 16, 8, 0))
+        kind = "LAN"
+    else:
+        info = device.SpecialInfo.stUsb3VInfo
+        extra = ""
+        kind = "USB"
+    model = _cstr(info.chModelName)
+    serial = _cstr(info.chSerialNumber)
+    return {"id": serial, "kind": kind, "label": f"[{kind}] {model} · {serial}{extra}"}
 
 
 def _timestamp(tag):
@@ -69,11 +104,12 @@ def _timestamp(tag):
 class VideoRecorder(threading.Thread):
     """เขียนวิดีโอใน thread แยก เพื่อไม่ให้การเข้ารหัสมาหน่วงการรับภาพ"""
 
-    def __init__(self, path, fps, size):
+    def __init__(self, path, fps, size, is_color=False):
         super().__init__(daemon=True)
         self.path = path
         self.fps = fps
         self.size = size
+        self.is_color = is_color
         self.frames = 0
         self.error = ""
         self.ready = threading.Event()
@@ -94,7 +130,7 @@ class VideoRecorder(threading.Thread):
                 cv2.VideoWriter_fourcc(*codec),
                 float(self.fps),
                 self.size,
-                isColor=False,
+                isColor=self.is_color,
             )
             if writer.isOpened():
                 break
@@ -144,6 +180,10 @@ class CameraWorker(threading.Thread):
         self._opened = False
         self._grabbing = False
         self._connected = False
+        self._want_id = None       # serial ของกล้องที่ผู้ใช้เลือก (None = ตัวแรกที่เจอ)
+        self._next_scan = 0.0
+        self._last_frame_at = 0.0
+        self._pixel_code = None
         self._stop_event = threading.Event()
         self.cmds = queue.Queue()
 
@@ -154,6 +194,10 @@ class CameraWorker(threading.Thread):
         self.status_lock = threading.Lock()
         self.state = {
             "connected": False,
+            "devices": [],
+            "selected": "",
+            "pixel_format": "",
+            "color": False,
             "error": "",
             "message": "",
             "width": 0,
@@ -270,15 +314,33 @@ class CameraWorker(threading.Thread):
         return buf.tobytes() if ok else b""
 
     # ---------- camera ----------
-    def _open_camera(self):
+    def _enumerate(self):
+        """สแกนกล้อง USB + LAN คืน (list_struct, [(meta, device)]) และอัปเดตรายการในสถานะ
+
+        ต้องเก็บ list_struct ไว้ตราบที่ยังใช้ device เพราะ device ชี้ไปยังหน่วยความจำของมัน
+        """
         devices = MV_CC_DEVICE_INFO_LIST()
-        ret = MvCamera.MV_CC_EnumDevices(MV_USB_DEVICE, devices)
+        ret = MvCamera.MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, devices)
         if ret != 0:
             raise RuntimeError(f"ค้นหากล้องไม่สำเร็จ: {ret:#x}")
-        if devices.nDeviceNum == 0:
-            raise RuntimeError("ไม่พบกล้อง Hikrobot USB")
+        found = []
+        for i in range(devices.nDeviceNum):
+            device = cast(devices.pDeviceInfo[i], POINTER(MV_CC_DEVICE_INFO)).contents
+            found.append((_device_meta(device), device))
+        with self.status_lock:
+            self.state["devices"] = [meta for meta, _ in found]
+        return devices, found
 
-        device = cast(devices.pDeviceInfo[0], POINTER(MV_CC_DEVICE_INFO)).contents
+    def _open_camera(self):
+        devices, found = self._enumerate()  # noqa: F841  (devices ต้องไม่ถูกเก็บขยะก่อนเปิดกล้อง)
+        if not found:
+            raise RuntimeError("ไม่พบกล้อง Hikrobot (USB/LAN)")
+
+        meta, device = next(
+            (item for item in found if item[0]["id"] == self._want_id), found[0]
+        )
+        with self.status_lock:
+            self.state["selected"] = meta["id"]
 
         self.cam = MvCamera()
         ret = self.cam.MV_CC_CreateHandle(device)
@@ -301,9 +363,21 @@ class CameraWorker(threading.Thread):
         if ret != 0:
             raise RuntimeError(f"ตั้ง TriggerMode ไม่สำเร็จ: {ret:#x}")
 
-        ret = self.cam.MV_CC_SetEnumValue("PixelFormat", PixelType_Gvsp_Mono8)
-        if ret != 0:
-            raise RuntimeError(f"ตั้ง Mono8 ไม่สำเร็จ: {ret:#x}")
+        # กล้อง LAN: ตั้งขนาดแพ็กเก็ตให้เหมาะกับเครือข่าย ไม่งั้นภาพอาจหลุด/กระตุก
+        if device.nTLayerType == MV_GIGE_DEVICE:
+            packet = self.cam.MV_CC_GetOptimalPacketSize()
+            if packet > 0:
+                self.cam.MV_CC_SetIntValue("GevSCPSPacketSize", packet)
+
+        for fmt, fmt_name, code in PIXEL_FORMATS:
+            if self.cam.MV_CC_SetEnumValue("PixelFormat", fmt) == 0:
+                self._pixel_code = code
+                break
+        else:
+            raise RuntimeError("กล้องไม่รองรับรูปแบบภาพ Bayer/BGR/RGB/Mono8")
+        with self.status_lock:
+            self.state["pixel_format"] = fmt_name
+            self.state["color"] = code is not None
 
         # ปิดโหมดอัตโนมัติ เพื่อให้ปรับ Exposure/Gain เองได้
         self.cam.MV_CC_SetEnumValue("ExposureAuto", 0)
@@ -337,7 +411,15 @@ class CameraWorker(threading.Thread):
             width = int(info.nWidth)
             height = int(info.nHeight)
             raw = string_at(frame_out.pBufAddr, info.nFrameLen)
-            return np.frombuffer(raw, dtype=np.uint8).reshape(height, width).copy()
+            data = np.frombuffer(raw, dtype=np.uint8)
+            code = self._pixel_code
+            if code is None:
+                return data.reshape(height, width).copy()
+            if code == "bgr":
+                return data.reshape(height, width, 3).copy()
+            if code == "rgb":
+                return cv2.cvtColor(data.reshape(height, width, 3), cv2.COLOR_RGB2BGR)
+            return cv2.cvtColor(data.reshape(height, width), code)
         finally:
             self.cam.MV_CC_FreeImageBuffer(frame_out)
 
@@ -373,6 +455,7 @@ class CameraWorker(threading.Thread):
             self._disconnect(str(exc))
             return False
         self._connected = True
+        self._last_frame_at = time.monotonic()
         with self.status_lock:
             self.state["connected"] = True
             self.state["error"] = ""
@@ -381,6 +464,8 @@ class CameraWorker(threading.Thread):
     def _disconnect(self, error=""):
         self._connected = False
         self._close_record()
+        if self._state_get("capture")["state"] == "active":
+            self._stop_capture("หยุดถ่ายรูปเพราะกล้องไม่เชื่อมต่อ")
         self._close_camera()
         self._measured_fps = 0.0
         self._frame_times = []
@@ -398,11 +483,23 @@ class CameraWorker(threading.Thread):
             while not self._stop_event.is_set():
                 self._process_commands()
                 if not self._connected:
+                    # ยังไม่มีกล้อง: สแกนและต่ออัตโนมัติเป็นระยะ (เสียบกล้องแล้วต่อเอง)
+                    if time.monotonic() >= self._next_scan:
+                        self._next_scan = time.monotonic() + SCAN_INTERVAL_S
+                        self._connect()
                     self._stop_event.wait(0.1)
                     continue
                 try:
                     frame = self._grab_frame()
                     now = time.monotonic()
+                    if frame is not None:
+                        self._last_frame_at = now
+                    elif (
+                        now - self._last_frame_at > LOST_AFTER_S
+                        and not self.cam.MV_CC_IsDeviceConnected()
+                    ):
+                        self._disconnect("กล้องหลุดการเชื่อมต่อ (กำลังรอเชื่อมต่อใหม่อัตโนมัติ)")
+                        continue
                     shown = self._publish(frame, now) if frame is not None else None
                     self._tick(now, shown)
                 except Exception as exc:
@@ -479,7 +576,7 @@ class CameraWorker(threading.Thread):
         path = os.path.join(VIDEO_DIR, name)
         height, width = self.frame.shape[:2]
 
-        recorder = VideoRecorder(path, fps, (width, height))
+        recorder = VideoRecorder(path, fps, (width, height), is_color=self.frame.ndim == 3)
         recorder.start()
         recorder.ready.wait(2.0)
         if recorder.error or not recorder.ready.is_set():
@@ -585,7 +682,13 @@ class CameraWorker(threading.Thread):
             try:
                 if name == "shutdown":
                     self._stop_event.set()
+                elif name == "scan":
+                    # สแกนรายการกล้องอย่างเดียว ไม่ตัดการเชื่อมต่อกล้องที่ใช้อยู่
+                    self._enumerate()
+                    self._set_message(f"พบกล้อง {len(self._state_get('devices'))} ตัว")
                 elif name == "reconnect":
+                    if args.get("id"):
+                        self._want_id = str(args["id"])
                     self._disconnect()
                     if self._connect():
                         self._set_message("เชื่อมต่อกล้องใหม่สำเร็จ")
@@ -743,7 +846,14 @@ def api_status():
 
 @app.post("/api/camera/reconnect")
 def api_camera_reconnect():
-    worker.send_command("reconnect", wait=10.0)
+    body = request.get_json(silent=True) or {}
+    worker.send_command("reconnect", {"id": body.get("id")}, wait=10.0)
+    return jsonify(worker.status())
+
+
+@app.post("/api/camera/scan")
+def api_camera_scan():
+    worker.send_command("scan", wait=5.0)
     return jsonify(worker.status())
 
 
@@ -950,6 +1060,8 @@ input[type=number]:focus{outline:1px solid #a8a89e;outline-offset:1px}
 .status{margin-top:11px;padding:8px 10px;border:1px solid var(--line-soft);border-radius:5px;background:#fbfbf8;font-size:12px;line-height:1.6;color:var(--ink-soft);min-height:38px;overflow-wrap:anywhere}
 .status b{font-weight:600;color:var(--ink)}
 .btn.folder{flex:0 0 auto;margin-left:auto}
+.preview-head{flex-wrap:wrap}
+.camselect{flex:1 1 200px;min-width:0;max-width:340px;margin-left:auto;padding:6px 8px;border:1px solid var(--line);border-radius:5px;background:#fdfdfb;color:var(--ink);font:12px "Segoe UI","Leelawadee UI",Tahoma,sans-serif}
 dialog{border:1px solid var(--line);border-radius:8px;padding:0;width:min(640px,94vw);max-height:80vh;color:var(--ink);background:var(--panel)}
 dialog::backdrop{background:rgba(0,0,0,.35)}
 .dlg-head{display:flex;align-items:center;gap:8px;padding:12px 15px;border-bottom:1px solid var(--line-soft)}
@@ -987,8 +1099,10 @@ dialog::backdrop{background:rgba(0,0,0,.35)}
   <section class="card preview">
     <div class="preview-head">
       <span class="preview-title">ภาพจากกล้อง</span>
-      <span class="preview-note">Mono8 · ภาพสด</span>
-      <button class="btn folder" id="reconnect" type="button">🔄 เชื่อมต่อกล้องใหม่</button>
+      <span class="preview-note" id="previewNote">ภาพสด</span>
+      <select class="camselect" id="camSelect" aria-label="เลือกกล้อง"><option value="">ไม่พบกล้อง</option></select>
+      <button class="btn folder" id="scanCams" style="margin-left:0" type="button" title="สแกนหากล้อง USB/LAN">🔍 สแกน</button>
+      <button class="btn folder" id="reconnect" style="margin-left:0" type="button">🔄 เชื่อมต่อกล้องใหม่</button>
       <button class="btn folder" id="openFiles" style="margin-left:0" type="button">📁 โฟลเดอร์ไฟล์</button>
     </div>
     <div class="viewer">
@@ -1282,6 +1396,35 @@ function durationOf(numId, unitId) {
 
 let settingsLoaded = false;
 
+// รายการกล้อง: อัปเดตเฉพาะเมื่อรายการเปลี่ยน และไม่แตะตอนผู้ใช้กำลังเลือกอยู่
+let camSignature = "";
+function renderCameras(st) {
+  const sel = $("camSelect");
+  const devices = st.devices || [];
+  const signature = JSON.stringify(devices.map((d) => d.id));
+  if (signature !== camSignature && document.activeElement !== sel) {
+    camSignature = signature;
+    sel.textContent = "";
+    if (!devices.length) {
+      sel.add(new Option("ไม่พบกล้อง (กำลังสแกนอัตโนมัติ)", ""));
+    }
+    for (const d of devices) sel.add(new Option(d.label, d.id));
+  }
+  if (document.activeElement !== sel && st.selected) sel.value = st.selected;
+}
+
+$("camSelect").onchange = async (ev) => {
+  if (!ev.target.value) return;
+  ev.target.blur();
+  await reconnectCamera(ev.target.value);
+};
+$("scanCams").onclick = async () => {
+  const btn = $("scanCams");
+  btn.disabled = true;
+  try { render(await post("/api/camera/scan", {})); }
+  finally { btn.disabled = false; }
+};
+
 function render(st) {
   if (!st) return;
   const connected = !!st.connected;
@@ -1297,6 +1440,10 @@ function render(st) {
     chip.textContent = "กำลังเชื่อมต่อ";
     chip.className = "chip";
   }
+
+  $("previewNote").textContent = st.pixel_format && connected
+    ? `${st.pixel_format} · ภาพสด` : "ภาพสด";
+  renderCameras(st);
 
   $("resChip").textContent = st.width ? `${st.width} × ${st.height}` : "—";
   $("fpsChip").textContent = st.fps ? `FPS ${num(st.fps)}` : "FPS —";
@@ -1393,12 +1540,13 @@ $("recStart").onclick = async () =>
     duration_s: durationOf("recDur", "recUnit"),
   }));
 
-$("reconnect").onclick = async () => {
+async function reconnectCamera(id) {
   const btn = $("reconnect");
   btn.disabled = true;
   btn.textContent = "กำลังเชื่อมต่อ...";
   try {
-    render(await post("/api/camera/reconnect", {}));
+    settingsLoaded = false;  // กล้องตัวใหม่มีช่วง Exposure/Gain ไม่เท่ากัน ให้โหลดค่าใหม่
+    render(await post("/api/camera/reconnect", id ? { id } : {}));
     // บังคับให้ stream เปิดใหม่ เผื่อการเชื่อมต่อ MJPEG ค้างจากตอนกล้องหลุด
     $("stream").src = "/stream?t=" + Date.now();
   } catch (err) {
@@ -1407,7 +1555,8 @@ $("reconnect").onclick = async () => {
     btn.disabled = false;
     btn.textContent = "🔄 เชื่อมต่อกล้องใหม่";
   }
-};
+}
+$("reconnect").onclick = () => reconnectCamera();
 
 $("recStop").onclick = async () => render(await post("/api/record/stop", {}));
 
