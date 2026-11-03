@@ -22,7 +22,7 @@ from ctypes import POINTER, cast, string_at
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, abort, jsonify, request, send_from_directory
 
 
 # ให้พิมพ์ข้อความภาษาไทยบน console Windows ได้
@@ -86,13 +86,19 @@ class VideoRecorder(threading.Thread):
             self._latest = frame
 
     def run(self):
-        writer = cv2.VideoWriter(
-            self.path,
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            float(self.fps),
-            self.size,
-            isColor=False,
-        )
+        # H.264 (avc1) เล่นในเบราว์เซอร์ได้ ส่วน mp4v เล่นไม่ได้ จึงลอง avc1 ก่อนแล้วค่อยถอยไป mp4v
+        writer = None
+        for codec in ("avc1", "mp4v"):
+            writer = cv2.VideoWriter(
+                self.path,
+                cv2.VideoWriter_fourcc(*codec),
+                float(self.fps),
+                self.size,
+                isColor=False,
+            )
+            if writer.isOpened():
+                break
+            writer.release()
         if not writer.isOpened():
             self.error = "เปิดไฟล์วิดีโอไม่สำเร็จ (ตรวจสิทธิ์เขียนโฟลเดอร์ videos)"
             self.ready.set()
@@ -137,6 +143,7 @@ class CameraWorker(threading.Thread):
         self._created = False
         self._opened = False
         self._grabbing = False
+        self._connected = False
         self._stop_event = threading.Event()
         self.cmds = queue.Queue()
 
@@ -358,33 +365,48 @@ class CameraWorker(threading.Thread):
         self._grabbing = self._opened = self._created = False
 
     # ---------- loop ----------
-    def run(self):
+    def _connect(self):
+        """เปิดกล้อง (ใช้ทั้งตอนเริ่มและตอนกดเชื่อมต่อใหม่) ถ้าไม่สำเร็จจะเก็บ error ไว้และ thread ยังทำงานต่อ"""
         try:
             self._open_camera()
         except Exception as exc:
-            with self.status_lock:
-                self.state["connected"] = False
-                self.state["error"] = str(exc)
-            with self.frame_cond:
-                self.frame_cond.notify_all()
-            self._close_camera()
-            return
-
+            self._disconnect(str(exc))
+            return False
+        self._connected = True
         with self.status_lock:
             self.state["connected"] = True
             self.state["error"] = ""
+        return True
 
+    def _disconnect(self, error=""):
+        self._connected = False
+        self._close_record()
+        self._close_camera()
+        self._measured_fps = 0.0
+        self._frame_times = []
+        with self.status_lock:
+            self.state["connected"] = False
+            self.state["error"] = error
+            self.state["fps"] = 0.0
+        with self.frame_cond:
+            self.frame = None
+            self.frame_cond.notify_all()
+
+    def run(self):
+        self._connect()
         try:
             while not self._stop_event.is_set():
                 self._process_commands()
-                frame = self._grab_frame()
-                now = time.monotonic()
-                shown = self._publish(frame, now) if frame is not None else None
-                self._tick(now, shown)
-        except Exception as exc:
-            with self.status_lock:
-                self.state["connected"] = False
-                self.state["error"] = f"การทำงานของกล้องหยุดกลางคัน: {exc}"
+                if not self._connected:
+                    self._stop_event.wait(0.1)
+                    continue
+                try:
+                    frame = self._grab_frame()
+                    now = time.monotonic()
+                    shown = self._publish(frame, now) if frame is not None else None
+                    self._tick(now, shown)
+                except Exception as exc:
+                    self._disconnect(f"การทำงานของกล้องหยุดกลางคัน: {exc}")
         finally:
             self._close_record()
             self._close_camera()
@@ -563,16 +585,31 @@ class CameraWorker(threading.Thread):
             try:
                 if name == "shutdown":
                     self._stop_event.set()
+                elif name == "reconnect":
+                    self._disconnect()
+                    if self._connect():
+                        self._set_message("เชื่อมต่อกล้องใหม่สำเร็จ")
+                    else:
+                        self._set_message("เชื่อมต่อกล้องไม่สำเร็จ ดูสาเหตุด้านบน")
                 elif name == "settings":
-                    self._apply_settings(args)
+                    if self._connected:
+                        self._apply_settings(args)
+                    else:
+                        self._set_message("กล้องยังไม่เชื่อมต่อ")
                 elif name == "record_start":
-                    self._command_record_start(args, now)
+                    if self._connected:
+                        self._command_record_start(args, now)
+                    else:
+                        self._set_message("กล้องยังไม่เชื่อมต่อ")
                 elif name == "record_stop":
                     if self._state_get("record")["state"] != "idle":
                         self._close_record()
                         self._set_message("หยุดอัดวิดีโอแล้ว")
                 elif name == "capture_start":
-                    self._command_capture_start(args, now)
+                    if self._connected:
+                        self._command_capture_start(args, now)
+                    else:
+                        self._set_message("กล้องยังไม่เชื่อมต่อ")
                 elif name == "capture_stop":
                     self._stop_capture("หยุดถ่ายรูปแล้ว")
             except Exception as exc:
@@ -704,6 +741,12 @@ def api_status():
     return jsonify(worker.status())
 
 
+@app.post("/api/camera/reconnect")
+def api_camera_reconnect():
+    worker.send_command("reconnect", wait=10.0)
+    return jsonify(worker.status())
+
+
 @app.post("/api/settings")
 def api_settings():
     body = request.get_json(silent=True) or {}
@@ -747,6 +790,34 @@ def api_capture_start():
 def api_capture_stop():
     worker.send_command("capture_stop")
     return jsonify(worker.status())
+
+
+MEDIA_DIRS = {"images": IMAGE_DIR, "videos": VIDEO_DIR}
+
+
+@app.get("/api/files/<kind>")
+def api_files(kind):
+    folder = MEDIA_DIRS.get(kind)
+    if folder is None:
+        abort(404)
+    items = []
+    for entry in os.scandir(folder):
+        if entry.is_file():
+            stat = entry.stat()
+            items.append({"name": entry.name, "size": stat.st_size, "mtime": stat.st_mtime})
+    items.sort(key=lambda item: item["mtime"], reverse=True)
+    return jsonify(items)
+
+
+@app.get("/files/<kind>/<path:name>")
+def download_file(kind, name):
+    folder = MEDIA_DIRS.get(kind)
+    if folder is None:
+        abort(404)
+    # send_from_directory กัน path traversal (../) ให้อยู่แล้ว
+    return send_from_directory(
+        folder, name, as_attachment=request.args.get("download") == "1"
+    )
 
 
 def mjpeg_stream():
@@ -878,6 +949,24 @@ input[type=number]:focus{outline:1px solid #a8a89e;outline-offset:1px}
 .hint{margin:7px 0 0;font-size:11.5px;line-height:1.5;color:var(--muted)}
 .status{margin-top:11px;padding:8px 10px;border:1px solid var(--line-soft);border-radius:5px;background:#fbfbf8;font-size:12px;line-height:1.6;color:var(--ink-soft);min-height:38px;overflow-wrap:anywhere}
 .status b{font-weight:600;color:var(--ink)}
+.btn.folder{flex:0 0 auto;margin-left:auto}
+dialog{border:1px solid var(--line);border-radius:8px;padding:0;width:min(640px,94vw);max-height:80vh;color:var(--ink);background:var(--panel)}
+dialog::backdrop{background:rgba(0,0,0,.35)}
+.dlg-head{display:flex;align-items:center;gap:8px;padding:12px 15px;border-bottom:1px solid var(--line-soft)}
+.dlg-head h2{margin:0 auto 0 0;font-size:13px;font-weight:600}
+.tabs{display:flex;gap:6px;padding:10px 15px 0}
+.tabs .btn{flex:0 0 auto}
+.tabs .btn.on{background:#26261f;border-color:#26261f;color:#fbfbf7}
+.filelist{overflow:auto;max-height:55vh;padding:6px 15px 14px}
+.file{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--line-soft);font-size:12.5px}
+.file a{color:var(--ink);text-decoration:none;overflow-wrap:anywhere;flex:1}
+.file a:hover{text-decoration:underline}
+.file small{color:var(--muted);white-space:nowrap}
+.previewbox{margin:10px 15px 0;background:#0d0d0c;border-radius:6px;text-align:center}
+.previewbox img,.previewbox video{display:block;max-width:100%;max-height:38vh;margin:0 auto}
+.previewbox p{margin:0;padding:8px 10px;font-size:11.5px;color:#cfcfc8}
+.file.sel{background:var(--line-soft)}
+.empty{padding:18px 0;color:var(--muted);font-size:12.5px}
 </style>
 </head>
 <body>
@@ -899,6 +988,8 @@ input[type=number]:focus{outline:1px solid #a8a89e;outline-offset:1px}
     <div class="preview-head">
       <span class="preview-title">ภาพจากกล้อง</span>
       <span class="preview-note">Mono8 · ภาพสด</span>
+      <button class="btn folder" id="reconnect" type="button">🔄 เชื่อมต่อกล้องใหม่</button>
+      <button class="btn folder" id="openFiles" style="margin-left:0" type="button">📁 โฟลเดอร์ไฟล์</button>
     </div>
     <div class="viewer">
       <img id="stream" src="/stream" alt="ภาพจากกล้อง">
@@ -1011,8 +1102,108 @@ input[type=number]:focus{outline:1px solid #a8a89e;outline-offset:1px}
   </section>
 </main>
 
+<dialog id="filesDlg">
+  <div class="dlg-head">
+    <h2>ไฟล์ที่บันทึกไว้</h2>
+    <button class="btn" id="closeFiles" type="button" style="flex:0 0 auto">ปิด</button>
+  </div>
+  <div class="tabs">
+    <button class="btn on" id="tabImages" type="button">รูปภาพ</button>
+    <button class="btn" id="tabVideos" type="button">วิดีโอ</button>
+  </div>
+  <div class="previewbox" id="previewBox" hidden></div>
+  <div class="filelist" id="fileList"></div>
+</dialog>
+
 <script>
 const $ = (id) => document.getElementById(id);
+
+// ---------- โฟลเดอร์ไฟล์: ให้ลูกค้าเปิดดู/ดาวน์โหลดรูปและวิดีโอ ----------
+let filesKind = "images";
+const fmtSize = (b) => b >= 1048576 ? (b / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(b / 1024)) + " KB";
+
+async function loadFiles() {
+  const list = $("fileList");
+  list.textContent = "กำลังโหลด...";
+  try {
+    const res = await fetch("/api/files/" + filesKind);
+    const items = await res.json();
+    list.textContent = "";
+    if (!items.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "ยังไม่มีไฟล์";
+      list.appendChild(empty);
+      return;
+    }
+    for (const it of items) {
+      const url = `/files/${filesKind}/${encodeURIComponent(it.name)}`;
+      const row = document.createElement("div");
+      row.className = "file";
+      const link = document.createElement("a");
+      link.href = url;
+      link.target = "_blank";
+      link.textContent = it.name;
+      link.onclick = (ev) => {
+        ev.preventDefault();
+        list.querySelectorAll(".file.sel").forEach((el) => el.classList.remove("sel"));
+        row.classList.add("sel");
+        showPreview(url);
+      };
+      const meta = document.createElement("small");
+      meta.textContent = `${fmtSize(it.size)} · ${new Date(it.mtime * 1000).toLocaleString()}`;
+      const dl = document.createElement("a");
+      dl.href = url + "?download=1";
+      dl.textContent = "ดาวน์โหลด";
+      dl.style.flex = "0 0 auto";
+      row.append(link, meta, dl);
+      list.appendChild(row);
+    }
+  } catch (err) {
+    list.textContent = "โหลดรายการไม่สำเร็จ";
+  }
+}
+
+function clearPreview() {
+  const box = $("previewBox");
+  box.textContent = "";  // ถอด <video> ออกเพื่อหยุดโหลด/เล่น
+  box.hidden = true;
+}
+
+function showPreview(url) {
+  const box = $("previewBox");
+  box.textContent = "";
+  let media;
+  if (filesKind === "videos") {
+    media = document.createElement("video");
+    media.controls = true;
+    media.autoplay = true;
+    media.preload = "metadata";
+    const note = document.createElement("p");
+    note.textContent = "ถ้าวิดีโอไม่เล่น (ไฟล์เก่าอาจเป็น mp4v) ให้กดดาวน์โหลดแล้วเปิดในเครื่อง";
+    media.src = url;
+    box.append(media, note);
+  } else {
+    media = document.createElement("img");
+    media.src = url;
+    media.alt = "ตัวอย่างรูป";
+    box.append(media);
+  }
+  box.hidden = false;
+}
+
+function setKind(kind) {
+  clearPreview();
+  filesKind = kind;
+  $("tabImages").classList.toggle("on", kind === "images");
+  $("tabVideos").classList.toggle("on", kind === "videos");
+  loadFiles();
+}
+$("openFiles").onclick = () => { $("filesDlg").showModal(); setKind(filesKind); };
+$("closeFiles").onclick = () => $("filesDlg").close();
+$("filesDlg").addEventListener("close", clearPreview);
+$("tabImages").onclick = () => setKind("images");
+$("tabVideos").onclick = () => setKind("videos");
 const num = (v, d = 1) => (v === null || v === undefined ? "-" : Number(v).toFixed(d));
 const fmtTime = (s) => {
   s = Math.max(0, Math.round(s));
@@ -1201,6 +1392,22 @@ $("recStart").onclick = async () =>
     delay_s: Number($("recDelay").value || 0),
     duration_s: durationOf("recDur", "recUnit"),
   }));
+
+$("reconnect").onclick = async () => {
+  const btn = $("reconnect");
+  btn.disabled = true;
+  btn.textContent = "กำลังเชื่อมต่อ...";
+  try {
+    render(await post("/api/camera/reconnect", {}));
+    // บังคับให้ stream เปิดใหม่ เผื่อการเชื่อมต่อ MJPEG ค้างจากตอนกล้องหลุด
+    $("stream").src = "/stream?t=" + Date.now();
+  } catch (err) {
+    $("message").textContent = "เชื่อมต่อกล้องใหม่ไม่สำเร็จ";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "🔄 เชื่อมต่อกล้องใหม่";
+  }
+};
 
 $("recStop").onclick = async () => render(await post("/api/record/stop", {}));
 
